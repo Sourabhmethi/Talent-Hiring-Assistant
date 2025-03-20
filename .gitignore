@@ -1,0 +1,30 @@
+# Ignore environment variables
+.env
+dotenv
+env
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+# Ignore virtual environment directories
+venv/
+.env/
+
+# Ignore data and generated candidate files
+data/
+candidate_*.json
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore Streamlit specific cache
+.streamlit/
+
+# Ignore logs and temporary files
+*.log
+*.tmp
