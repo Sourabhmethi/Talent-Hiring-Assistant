@@ -86,8 +86,5 @@ Candidate data is saved in JSON format in the `data/` directory. Each file is na
 - For API-related errors, verify your API key and check your internet connection
 - If technical questions aren't generating properly, try adjusting the fallback questions logic
 
-## License
-[Your License Here]
-
 ## Contributing
 Contributions are welcome! Please feel free to submit a Pull Request.
