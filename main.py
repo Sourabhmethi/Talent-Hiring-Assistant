@@ -1,10 +1,13 @@
-
 import streamlit as st
 import google.generativeai as genai
 import re
 import json
 import os
+import io
 from datetime import datetime
+import PyPDF2
+import docx
+# import base64
 
 # Set up the Gemini API key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")  # Replace with your actual API key or use environment variable
@@ -28,7 +31,9 @@ def initialize_session():
             "experience": "",
             "desired_position": "",
             "location": "",
-            "tech_stack": []
+            "tech_stack": [],
+            "resume_text": "",  # New field for resume text
+            "resume_filename": ""  # New field for resume filename
         }
     if 'current_stage' not in st.session_state:
         st.session_state.current_stage = "greeting"
@@ -36,6 +41,8 @@ def initialize_session():
         st.session_state.technical_questions = []
     if 'asked_questions' not in st.session_state:
         st.session_state.asked_questions = []
+    if 'resume_uploaded' not in st.session_state:
+        st.session_state.resume_uploaded = False
 
 # Validate email format
 def is_valid_email(email):
@@ -47,6 +54,107 @@ def is_valid_phone(phone):
     # Basic validation - looks for a sequence of digits
     pattern = r'^\d{10,15}$'
     return re.match(pattern, phone) is not None
+
+# Extract text from PDF
+def extract_text_from_pdf(file):
+    try:
+        pdf_reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error extracting text from PDF: {str(e)}")
+        return ""
+
+# Extract text from DOCX
+def extract_text_from_docx(file):
+    try:
+        doc = docx.Document(file)
+        text = ""
+        for para in doc.paragraphs:
+            text += para.text + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error extracting text from DOCX: {str(e)}")
+        return ""
+
+# Extract text from resume file
+def extract_resume_text(uploaded_file):
+    text = ""
+    if uploaded_file is not None:
+        # Create a copy of the file in memory
+        bytes_data = uploaded_file.getvalue()
+        
+        # Determine file type and extract text
+        file_type = uploaded_file.type
+        file_name = uploaded_file.name
+        
+        if file_type == "application/pdf":
+            text = extract_text_from_pdf(io.BytesIO(bytes_data))
+        elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            text = extract_text_from_docx(io.BytesIO(bytes_data))
+        elif file_type == "text/plain":
+            text = bytes_data.decode("utf-8")
+        else:
+            st.error(f"Unsupported file type: {file_type}. Please upload a PDF, DOCX, or TXT file.")
+            
+        # Save file info
+        st.session_state.candidate_info["resume_filename"] = file_name
+    
+    return text
+
+# Analyze resume using Gemini API
+def analyze_resume(resume_text):
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        
+        prompt = f"""
+        Analyze the following resume text and extract key information:
+        
+        {resume_text}
+        
+        Please extract and format the following information:
+        1. Name
+        2. Email
+        3. Phone number
+        4. Total years of experience
+        5. Most recent position/title
+        6. Current/most recent location
+        7. Technical skills and technologies (as a comma-separated list)
+        
+        Format your response as a JSON object with these keys: name, email, phone, experience, position, location, tech_stack
+        Only return the JSON object, nothing else.
+        """
+        
+        generation_config = {
+            "temperature": 0.1,
+            "top_p": 0.95,
+            "top_k": 40,
+            "max_output_tokens": 1024,
+        }
+        
+        response = model.generate_content(prompt, generation_config=generation_config)
+        
+        # Try to parse the response as JSON
+        try:
+            # First clean up the response to ensure it's valid JSON
+            json_text = response.text.strip()
+            # Remove markdown code blocks if present
+            if json_text.startswith("```json"):
+                json_text = json_text.replace("```json", "").replace("```", "").strip()
+            elif json_text.startswith("```"):
+                json_text = json_text.replace("```", "").strip()
+                
+            resume_data = json.loads(json_text)
+            return resume_data
+        except json.JSONDecodeError:
+            print(f"Failed to parse JSON: {response.text}")
+            return None
+            
+    except Exception as e:
+        print(f"Error analyzing resume: {str(e)}")
+        return None
 
 # Save candidate data to file
 def save_candidate_data():
@@ -95,6 +203,12 @@ def get_system_prompt(stage):
         Now focus on understanding their tech stack in detail. Ask them to list all programming languages, 
         frameworks, databases, and tools they are proficient in. Encourage them to be specific.
         """
+    elif stage == "resume_upload":
+        return base_prompt + f"""
+        You have collected the candidate's basic information.
+        Now ask them to upload their resume for a more detailed assessment.
+        Explain that they can upload a PDF, DOCX, or TXT file using the file uploader in the sidebar.
+        """
     elif stage == "generate_questions":
         return base_prompt + f"""
         Based on the candidate's tech stack: {st.session_state.candidate_info['tech_stack']}, 
@@ -120,7 +234,7 @@ def get_system_prompt(stage):
         return base_prompt
 
 # Generate technical questions using the Gemini API
-def generate_technical_questions(tech_stack, position):
+def generate_technical_questions(tech_stack, position, resume_text=""):
     try:
         # Create a new model instance with the corrected model name
         model = genai.GenerativeModel(MODEL_NAME)
@@ -130,11 +244,15 @@ def generate_technical_questions(tech_stack, position):
         Generate 5 technical interview questions for a {position} candidate 
         who is proficient in the following technologies: {', '.join(tech_stack)}.
         
+        Additional resume information:
+        {resume_text[:5000] if resume_text else "Not provided"}
+        
         Questions should:
         1. Be specific to the technologies mentioned - ensure you create at least one question for each major technology in the stack
         2. Range from basic to advanced
         3. Test both theoretical knowledge and practical application
         4. Be clear and concise
+        5. If the resume is provided, tailor some questions to their specific experience
         
         Make sure to distribute questions across different technologies in the tech stack.
         Format the output as a numbered list of questions only, without any introductions or explanations.
@@ -246,29 +364,50 @@ def process_user_input(user_input):
         
         elif not st.session_state.candidate_info["location"]:
             st.session_state.candidate_info["location"] = user_input.strip()
-            st.session_state.current_stage = "tech_stack"
-            return "Almost done with the basics! Now, please list your tech stack - all programming languages, frameworks, databases, and tools you're proficient with."
+            st.session_state.current_stage = "resume_upload"
+            return "Thank you for providing your basic information. Could you please upload your resume using the file uploader in the sidebar? This will help us better understand your experience and skills. Supported formats are PDF, DOCX, and TXT."
+    
+    elif st.session_state.current_stage == "resume_upload":
+        # After resume is processed, move to tech stack if response is received
+        st.session_state.current_stage = "tech_stack"
+        
+        # Check if we already have tech stack info from the resume
+        if st.session_state.resume_uploaded and st.session_state.candidate_info["tech_stack"]:
+            tech_stack_str = ", ".join(st.session_state.candidate_info["tech_stack"])
+            return f"Based on your resume, I see you have experience with: {tech_stack_str}. Could you please confirm or add any other technologies you're proficient with that may not be on your resume?"
+        else:
+            return "Now, please list your tech stack - all programming languages, frameworks, databases, and tools you're proficient with."
     
     elif st.session_state.current_stage == "tech_stack":
         # Process tech stack information
-        tech_stack = [tech.strip() for tech in re.split(r'[,;]|\band\b', user_input) if tech.strip()]
-        st.session_state.candidate_info["tech_stack"] = tech_stack
+        if st.session_state.candidate_info["tech_stack"] and user_input.lower() in ["yes", "correct", "that's right", "that is correct", "confirmed", "looks good"]:
+            # User confirmed the tech stack extracted from resume
+            pass
+        else:
+            # User provided or updated tech stack
+            tech_stack = [tech.strip() for tech in re.split(r'[,;]|\band\b', user_input) if tech.strip()]
+            if st.session_state.candidate_info["tech_stack"]:
+                # Merge with existing tech stack
+                st.session_state.candidate_info["tech_stack"] = list(set(st.session_state.candidate_info["tech_stack"] + tech_stack))
+            else:
+                st.session_state.candidate_info["tech_stack"] = tech_stack
         
         # Generate technical questions
         st.session_state.current_stage = "generate_questions"
         
         # Use the updated function to generate questions
         st.session_state.technical_questions = generate_technical_questions(
-            tech_stack, 
-            st.session_state.candidate_info["desired_position"]
+            st.session_state.candidate_info["tech_stack"], 
+            st.session_state.candidate_info["desired_position"],
+            st.session_state.candidate_info["resume_text"]
         )
         
         if not st.session_state.technical_questions:
             # Fallback if no questions were generated
             st.session_state.technical_questions = [
-                {"question": f"1. Tell me about your experience with {tech_stack[0]}.", "answer": None},
-                {"question": f"2. What projects have you worked on using {tech_stack[0]}?", "answer": None},
-                {"question": f"3. How do you keep up with changes in {tech_stack[0]}?", "answer": None}
+                {"question": f"1. Tell me about your experience with {st.session_state.candidate_info['tech_stack'][0]}.", "answer": None},
+                {"question": f"2. What projects have you worked on using {st.session_state.candidate_info['tech_stack'][0]}?", "answer": None},
+                {"question": f"3. How do you keep up with changes in {st.session_state.candidate_info['tech_stack'][0]}?", "answer": None}
             ]
         
         st.session_state.current_stage = "ask_questions"
@@ -328,6 +467,69 @@ def process_user_input(user_input):
     # Fallback for unexpected states
     return "I'm sorry, I didn't understand. Could you please rephrase your response?"
 
+# Handle resume upload and processing
+def handle_resume_upload():
+    if st.session_state.current_stage == "resume_upload" or not st.session_state.resume_uploaded:
+        uploaded_file = st.sidebar.file_uploader("Upload your resume (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"])
+        
+        if uploaded_file is not None:
+            # Process the resume
+            with st.sidebar:
+                with st.spinner("Processing resume..."):
+                    # Extract text from resume
+                    resume_text = extract_resume_text(uploaded_file)
+                    st.session_state.candidate_info["resume_text"] = resume_text
+                    
+                    # Analyze resume with Gemini
+                    if resume_text:
+                        resume_data = analyze_resume(resume_text)
+                        
+                        if resume_data:
+                            # Update session state with resume data
+                            st.write("✅ Resume processed successfully!")
+                            
+                            # Show extracted information
+                            with st.expander("Resume Information", expanded=False):
+                                st.json(resume_data)
+                            
+                            # Pre-fill candidate info from resume if fields are empty
+                            if not st.session_state.candidate_info["name"] and "name" in resume_data:
+                                st.session_state.candidate_info["name"] = resume_data["name"]
+                            if not st.session_state.candidate_info["email"] and "email" in resume_data:
+                                st.session_state.candidate_info["email"] = resume_data["email"]
+                            if not st.session_state.candidate_info["phone"] and "phone" in resume_data:
+                                st.session_state.candidate_info["phone"] = resume_data["phone"]
+                            if not st.session_state.candidate_info["experience"] and "experience" in resume_data:
+                                st.session_state.candidate_info["experience"] = resume_data["experience"]
+                            if not st.session_state.candidate_info["desired_position"] and "position" in resume_data:
+                                st.session_state.candidate_info["desired_position"] = resume_data["position"]
+                            if not st.session_state.candidate_info["location"] and "location" in resume_data:
+                                st.session_state.candidate_info["location"] = resume_data["location"]
+                            
+                            # Extract tech stack
+                            if "tech_stack" in resume_data and resume_data["tech_stack"]:
+                                if isinstance(resume_data["tech_stack"], list):
+                                    tech_stack = resume_data["tech_stack"]
+                                else:
+                                    # Split string into list
+                                    tech_stack = [tech.strip() for tech in re.split(r'[,;]|\band\b', resume_data["tech_stack"]) if tech.strip()]
+                                
+                                st.session_state.candidate_info["tech_stack"] = tech_stack
+                        else:
+                            st.warning("Resume was processed but automatic information extraction failed. You'll need to provide your information manually.")
+                    
+                    # Mark as uploaded
+                    st.session_state.resume_uploaded = True
+                    
+                    # Create a download link for the processed resume text
+                    if resume_text:
+                        st.download_button(
+                            label="Download Extracted Text",
+                            data=resume_text,
+                            file_name="extracted_resume.txt",
+                            mime="text/plain"
+                        )
+
 # Main app function
 def main():
     st.set_page_config(page_title="TalentScout Hiring Assistant", page_icon="👨‍💻")
@@ -339,6 +541,9 @@ def main():
     st.title("TalentScout Hiring Assistant")
     st.write("Welcome to the TalentScout technical screening interview.")
     
+    # Sidebar
+    st.sidebar.title("Candidate Tools")
+    
     # Reset button
     if st.sidebar.button("Reset Conversation"):
         for key in list(st.session_state.keys()):
@@ -346,10 +551,14 @@ def main():
         initialize_session()
         st.rerun()
     
+    # Resume uploader in sidebar
+    handle_resume_upload()
+    
     # Debug info in sidebar (can be removed in production)
     with st.sidebar.expander("Debug Info", expanded=False):
         st.write("Current Stage:", st.session_state.current_stage)
-        st.write("Candidate Info:", st.session_state.candidate_info)
+        st.write("Candidate Info:", {k: v for k, v in st.session_state.candidate_info.items() if k != "resume_text"})
+        st.write("Resume Uploaded:", st.session_state.resume_uploaded)
         st.write("Technical Questions:", st.session_state.technical_questions)
         st.write("Asked Questions:", st.session_state.asked_questions)
     
@@ -364,7 +573,7 @@ def main():
         greeting = """
         Hello! I'm the TalentScout Hiring Assistant. I'll be conducting your initial screening interview.
         
-        I'll collect some basic information and ask a few technical questions to assess your experience with various technologies.
+        I'll collect some basic information, ask you to upload your resume, and then ask a few technical questions to assess your experience with various technologies.
         
         Let's start with your name. What is your full name?
         """
